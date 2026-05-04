@@ -208,7 +208,7 @@ void normalize_around_pivot(Row& row, uint64_t& rhs, uint32_t pivot, uint64_t p)
 extern "C" {
 
 const char* sprref_inc_version(void) {
-    return "sprref_incremental v0.1.0 (M2: insert + eager backsub)";
+    return "sprref_incremental v0.2.0 (M3: is_solved + expression buffers)";
 }
 
 sprref_inc_t* sprref_inc_init(uint64_t field_order, int n_threads) {
@@ -328,16 +328,73 @@ int sprref_inc_insert(sprref_inc_t* h,
 
 int sprref_inc_is_solved(sprref_inc_t* h,
                          uint32_t var_idx,
-                         const uint32_t* /*acceptable_free*/,
-                         size_t /*n_free*/,
-                         uint32_t** /*out_cols*/,
-                         uint64_t** /*out_vals*/,
-                         size_t* /*out_nnz*/,
-                         uint64_t* /*out_rhs*/) {
+                         const uint32_t* acceptable_free,
+                         size_t n_free,
+                         uint32_t** out_cols,
+                         uint64_t** out_vals,
+                         size_t* out_nnz,
+                         uint64_t* out_rhs) {
     if (!h) return SPRREF_INC_NOT_SOLVED;
-    /* M3 will fill out_* and apply acceptable_free filtering. */
-    (void)var_idx;
-    return SPRREF_INC_NOT_SOLVED;
+
+    auto it = h->basis.find(var_idx);
+    if (it == h->basis.end()) return SPRREF_INC_NOT_SOLVED;
+
+    const PivotRow& pr = it->second;
+
+    /* Decide solved-ness: every off-pivot column in the stored row must
+       either be a master or be in acceptable_free. (Because the basis is
+       maintained in true RREF, no off-pivot column can itself be a pivot —
+       forward elim + eager backsub guarantee this.) */
+    std::unordered_set<uint32_t> free_set;
+    if (acceptable_free && n_free > 0) {
+        free_set.reserve(n_free);
+        for (size_t i = 0; i < n_free; ++i) free_set.insert(acceptable_free[i]);
+    }
+
+    bool has_free = false;
+    for (auto& [c, v] : pr.coeffs) {
+        (void)v;
+        if (h->masters.count(c)) continue;
+        if (!free_set.empty() && free_set.count(c)) continue;
+        has_free = true;
+        break;
+    }
+
+    /* Still allocate and emit the expression even when has_free is true:
+       the caller (Python wrapper) may want the partial expression for
+       intermediate logs / pretty-printing. The bool return signals
+       solved-ness; the buffers carry the coefficients regardless. */
+    const size_t nnz = pr.coeffs.size();
+    if (out_nnz) *out_nnz = nnz;
+    if (out_rhs) *out_rhs = pr.rhs;
+
+    if (out_cols && out_vals) {
+        if (nnz == 0) {
+            *out_cols = nullptr;
+            *out_vals = nullptr;
+        } else {
+            auto* cols_buf = (uint32_t*)std::malloc(sizeof(uint32_t) * nnz);
+            auto* vals_buf = (uint64_t*)std::malloc(sizeof(uint64_t) * nnz);
+            if (!cols_buf || !vals_buf) {
+                std::free(cols_buf);
+                std::free(vals_buf);
+                *out_cols = nullptr;
+                *out_vals = nullptr;
+                if (out_nnz) *out_nnz = 0;
+                return SPRREF_INC_NOT_SOLVED;
+            }
+            size_t i = 0;
+            for (auto& [c, v] : pr.coeffs) {
+                cols_buf[i] = c;
+                vals_buf[i] = v;
+                ++i;
+            }
+            *out_cols = cols_buf;
+            *out_vals = vals_buf;
+        }
+    }
+
+    return has_free ? SPRREF_INC_NOT_SOLVED : SPRREF_INC_SOLVED;
 }
 
 void sprref_inc_buffer_free(uint32_t* cols, uint64_t* vals) {

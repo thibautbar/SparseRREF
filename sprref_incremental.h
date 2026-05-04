@@ -119,16 +119,21 @@ SPRREF_API int sprref_inc_insert(sprref_inc_t* h,
    counting as "unsolved". Pass NULL/0 to require strict full solving (only
    masters allowed as free).
 
-   On SPRREF_INC_SOLVED, the expression for var_idx is written to out_*:
-     - *out_cols, *out_vals are heap-allocated arrays of length *out_nnz.
-       Caller must free them via sprref_inc_buffer_free.
-     - *out_rhs is the constant term.
-   On SPRREF_INC_NOT_SOLVED, out_* are left untouched (and the caller should
-   not read them).
+   Output buffers (regardless of solved-ness, when var_idx is a pivot):
+     - *out_cols, *out_vals: heap-allocated arrays of length *out_nnz holding
+       the (col, coeff) pairs of the stored basis row's off-pivot part.
+       Caller must free via sprref_inc_buffer_free. May be NULL when nnz==0.
+     - *out_rhs: constant term of the stored row.
 
-   The returned expression is the *negated* off-pivot part: i.e. for the
-   normalised pivot row  x_v = rhs - sum_j coeff_j * x_j , out_cols/vals
-   contain (j, coeff_j) pairs and out_rhs = rhs.
+   Semantics: the basis row encodes x_{var_idx} + sum_j coeff_j * x_j = rhs,
+   so the caller derives x_{var_idx} = rhs - sum_j coeff_j * x_j. Coefficients
+   are returned as STORED (positive mod p), no negation applied — the Python
+   wrapper applies (-coeff) % p to match the existing solver-result convention.
+
+   If var_idx is not a pivot at all, returns SPRREF_INC_NOT_SOLVED and leaves
+   out_* untouched. If var_idx is a pivot but has unaccounted free columns,
+   the buffers are still populated (useful for intermediate logs) but the
+   return is SPRREF_INC_NOT_SOLVED.
 */
 SPRREF_API int sprref_inc_is_solved(sprref_inc_t* h,
                                     uint32_t var_idx,
