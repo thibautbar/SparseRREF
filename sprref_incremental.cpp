@@ -57,8 +57,20 @@ struct sprref_inc {
 
     std::unordered_map<uint32_t, PivotRow> basis;
     std::unordered_map<uint32_t, std::unordered_set<uint32_t>> col_to_pivots;
+    /* Two-component pivot key: comparison is lexicographic on (key0, key1).
+       Single-uint64 callers populate key0 and leave key1 == 0. Used by the
+       legacy single-call insert path; the two-phase path defers pivot choice
+       to the caller and ignores these. */
     std::unordered_map<uint32_t, uint64_t> pivot_keys;
+    std::unordered_map<uint32_t, uint64_t> pivot_keys_lo;
     std::unordered_set<uint32_t> masters;
+
+    /* Pending row buffer for the two-phase insert API.
+       has_pending == true iff insert_forward returned NEEDS_PIVOT and the
+       caller hasn't yet committed or aborted. */
+    bool has_pending = false;
+    Row pending_row;
+    uint64_t pending_rhs = 0;
 };
 
 /* =========================================================================
@@ -158,20 +170,42 @@ bool choose_pivot(const sprref_inc_t* h,
 
     bool found = false;
     uint32_t best_col = 0;
-    uint64_t best_key = 0;
-    auto key_of = [&](uint32_t c) -> uint64_t {
-        auto it = h->pivot_keys.find(c);
-        return it != h->pivot_keys.end() ? it->second : (uint64_t)c;
+    uint64_t best_k0 = 0, best_k1 = 0;
+    auto keys_of = [&](uint32_t c, uint64_t& k0, uint64_t& k1) {
+        auto it0 = h->pivot_keys.find(c);
+        if (it0 != h->pivot_keys.end()) {
+            k0 = it0->second;
+            auto it1 = h->pivot_keys_lo.find(c);
+            k1 = (it1 != h->pivot_keys_lo.end()) ? it1->second : 0;
+        } else {
+            /* No registered key — fall back to column index in k0, mirroring
+               SpotlightSolverSparseGF's `(1, c)` fallback (consistent monotone
+               order on c). */
+            k0 = (uint64_t)c;
+            k1 = 0;
+        }
     };
 
     for (auto& [c, v] : row) {
         (void)v;
         if (h->masters.count(c)) continue;
-        uint64_t k = key_of(c);
-        /* Tie-break by column index for determinism. */
-        if (!found || k < best_key || (k == best_key && c < best_col)) {
+        uint64_t k0, k1;
+        keys_of(c, k0, k1);
+        bool better = false;
+        if (!found) {
+            better = true;
+        } else if (k0 < best_k0) {
+            better = true;
+        } else if (k0 == best_k0 && k1 < best_k1) {
+            better = true;
+        } else if (k0 == best_k0 && k1 == best_k1 && c < best_col) {
+            /* Tie-break by column index for determinism. */
+            better = true;
+        }
+        if (better) {
             found = true;
-            best_key = k;
+            best_k0 = k0;
+            best_k1 = k1;
             best_col = c;
         }
     }
@@ -208,7 +242,7 @@ void normalize_around_pivot(Row& row, uint64_t& rhs, uint32_t pivot, uint64_t p)
 extern "C" {
 
 const char* sprref_inc_version(void) {
-    return "sprref_incremental v0.3.0 (delta pivot keys)";
+    return "sprref_incremental v0.5.0 (two-phase insert; pivot choice in caller)";
 }
 
 sprref_inc_t* sprref_inc_init(uint64_t field_order, int n_threads) {
@@ -244,6 +278,7 @@ void sprref_inc_set_pivot_order(sprref_inc_t* h,
                                 size_t n) {
     if (!h) return;
     h->pivot_keys.clear();
+    h->pivot_keys_lo.clear();
     h->pivot_keys.reserve(n);
     for (size_t i = 0; i < n; ++i) h->pivot_keys[cols[i]] = keys[i];
 }
@@ -254,7 +289,80 @@ void sprref_inc_add_pivot_keys(sprref_inc_t* h,
                                size_t n) {
     if (!h) return;
     h->pivot_keys.reserve(h->pivot_keys.size() + n);
-    for (size_t i = 0; i < n; ++i) h->pivot_keys[cols[i]] = keys[i];
+    for (size_t i = 0; i < n; ++i) {
+        h->pivot_keys[cols[i]] = keys[i];
+        /* Reset any stale lo half: callers using the single-key form should
+           see a consistent (key, 0) pair. */
+        h->pivot_keys_lo.erase(cols[i]);
+    }
+}
+
+void sprref_inc_add_pivot_keys2(sprref_inc_t* h,
+                                const uint32_t* cols,
+                                const uint64_t* key0s,
+                                const uint64_t* key1s,
+                                size_t n) {
+    if (!h) return;
+    h->pivot_keys.reserve(h->pivot_keys.size() + n);
+    h->pivot_keys_lo.reserve(h->pivot_keys_lo.size() + n);
+    for (size_t i = 0; i < n; ++i) {
+        h->pivot_keys[cols[i]] = key0s[i];
+        h->pivot_keys_lo[cols[i]] = key1s[i];
+    }
+}
+
+/* Helper: parse incoming sparse row into a normalised Row + grow nvars. */
+static void parse_input_row(sprref_inc_t* h, const uint32_t* cols, const uint64_t* vals,
+                            size_t nnz, Row& out_row) {
+    const uint64_t p = h->prime;
+    out_row.reserve(nnz);
+    for (size_t i = 0; i < nnz; ++i) {
+        uint64_t v = vals[i] % p;
+        if (v != 0) {
+            uint32_t c = cols[i];
+            auto it = out_row.find(c);
+            if (it == out_row.end()) out_row.emplace(c, v);
+            else {
+                uint64_t sum = it->second + v;
+                if (sum >= p) sum -= p;
+                if (sum == 0) out_row.erase(it);
+                else it->second = sum;
+            }
+            if (c >= h->nvars) h->nvars = c + 1;
+        }
+    }
+}
+
+/* Helper: normalize the row around pivot_col, do eager backsub, insert into basis. */
+static void commit_pivot_internal(sprref_inc_t* h, Row&& row, uint64_t rhs, uint32_t pivot_col) {
+    const uint64_t p = h->prime;
+
+    normalize_around_pivot(row, rhs, pivot_col, p);
+
+    /* Eager backward substitution: zero out pivot_col in every existing
+       basis row that touches it. */
+    auto rev_it = h->col_to_pivots.find(pivot_col);
+    if (rev_it != h->col_to_pivots.end()) {
+        std::vector<uint32_t> affected(rev_it->second.begin(), rev_it->second.end());
+        for (uint32_t other_pivot : affected) {
+            if (other_pivot == pivot_col) continue;
+            auto bit = h->basis.find(other_pivot);
+            if (bit == h->basis.end()) continue;
+            PivotRow& other = bit->second;
+            auto cit = other.coeffs.find(pivot_col);
+            if (cit == other.coeffs.end() || cit->second == 0) continue;
+            uint64_t factor = cit->second;
+            deindex_row(h, other_pivot, other.coeffs);
+            other.coeffs.erase(cit);
+            saxpy(other.coeffs, other.rhs, factor, row, rhs, p);
+            index_row(h, other_pivot, other.coeffs);
+        }
+    }
+
+    h->basis.emplace(pivot_col, PivotRow{std::move(row), rhs});
+    index_row(h, pivot_col, h->basis[pivot_col].coeffs);
+
+    if (pivot_col >= h->nvars) h->nvars = pivot_col + 1;
 }
 
 int sprref_inc_insert(sprref_inc_t* h,
@@ -267,23 +375,7 @@ int sprref_inc_insert(sprref_inc_t* h,
     const uint64_t p = h->prime;
 
     Row row;
-    row.reserve(nnz);
-    for (size_t i = 0; i < nnz; ++i) {
-        uint64_t v = vals[i] % p;
-        if (v != 0) {
-            uint32_t c = cols[i];
-            /* Combine duplicates if any (mod p sum). */
-            auto it = row.find(c);
-            if (it == row.end()) row.emplace(c, v);
-            else {
-                uint64_t sum = it->second + v;
-                if (sum >= p) sum -= p;
-                if (sum == 0) row.erase(it);
-                else it->second = sum;
-            }
-            if (c >= h->nvars) h->nvars = c + 1;
-        }
-    }
+    parse_input_row(h, cols, vals, nnz, row);
     rhs %= p;
 
     forward_eliminate(h, row, rhs);
@@ -297,43 +389,89 @@ int sprref_inc_insert(sprref_inc_t* h,
         /* All remaining entries are masters: no pivotable column. */
         return SPRREF_INC_DEPENDENT;
     }
-
-    normalize_around_pivot(row, rhs, pivot_col, p);
-
-    /* Eager backward substitution: zero out pivot_col in every existing
-       basis row that touches it. We use the reverse index, then re-index
-       each modified row since saxpy may add/remove columns. */
-    auto rev_it = h->col_to_pivots.find(pivot_col);
-    if (rev_it != h->col_to_pivots.end()) {
-        /* Snapshot: saxpy will mutate col_to_pivots, so iterate over a copy. */
-        std::vector<uint32_t> affected(rev_it->second.begin(), rev_it->second.end());
-        for (uint32_t other_pivot : affected) {
-            if (other_pivot == pivot_col) continue; /* not in basis yet, but defensive */
-            auto bit = h->basis.find(other_pivot);
-            if (bit == h->basis.end()) continue;
-            PivotRow& other = bit->second;
-            auto cit = other.coeffs.find(pivot_col);
-            if (cit == other.coeffs.end() || cit->second == 0) continue;
-            uint64_t factor = cit->second;
-            /* Deindex, saxpy against (row, rhs) [which has implicit pivot 1 — but the
-               new pivot row's stored coeffs do NOT include pivot_col since we erased it,
-               and the implicit "1 at pivot_col" cancels exactly with `factor` at that column].
-               After saxpy + erasing pivot_col entry, the row no longer touches pivot_col. */
-            deindex_row(h, other_pivot, other.coeffs);
-            other.coeffs.erase(cit); /* implicit "1" cancels factor exactly */
-            saxpy(other.coeffs, other.rhs, factor, row, rhs, p);
-            index_row(h, other_pivot, other.coeffs);
-        }
-    }
-
-    /* Insert new pivot. */
-    h->basis.emplace(pivot_col, PivotRow{std::move(row), rhs});
-    index_row(h, pivot_col, h->basis[pivot_col].coeffs);
-
-    if (pivot_col >= h->nvars) h->nvars = pivot_col + 1;
-
+    commit_pivot_internal(h, std::move(row), rhs, pivot_col);
     return SPRREF_INC_INDEPENDENT;
 }
+
+int sprref_inc_insert_forward(sprref_inc_t* h,
+                              const uint32_t* cols,
+                              const uint64_t* vals,
+                              size_t nnz,
+                              uint64_t rhs,
+                              uint32_t** out_candidate_cols,
+                              size_t* out_n_candidates) {
+    if (!h) return SPRREF_INC_DEPENDENT;
+    const uint64_t p = h->prime;
+
+    Row row;
+    parse_input_row(h, cols, vals, nnz, row);
+    rhs %= p;
+
+    forward_eliminate(h, row, rhs);
+
+    if (row.empty()) {
+        h->has_pending = false;
+        return rhs == 0 ? SPRREF_INC_DEPENDENT : SPRREF_INC_INCONSISTENT;
+    }
+
+    /* Stash for commit. */
+    h->pending_row = std::move(row);
+    h->pending_rhs = rhs;
+    h->has_pending = true;
+
+    /* Expose candidate columns to the caller. The Python wrapper applies
+       master / acceptable_free filtering and picks a pivot using its
+       native pivot_order dict. */
+    const size_t n = h->pending_row.size();
+    if (out_n_candidates) *out_n_candidates = n;
+    if (out_candidate_cols) {
+        if (n == 0) {
+            *out_candidate_cols = nullptr;
+        } else {
+            auto* buf = (uint32_t*)std::malloc(sizeof(uint32_t) * n);
+            if (!buf) {
+                /* Allocation failure: clear pending and degrade to DEPENDENT. */
+                h->pending_row.clear();
+                h->has_pending = false;
+                *out_candidate_cols = nullptr;
+                if (out_n_candidates) *out_n_candidates = 0;
+                return SPRREF_INC_DEPENDENT;
+            }
+            size_t i = 0;
+            for (auto& [c, v] : h->pending_row) {
+                (void)v;
+                buf[i++] = c;
+            }
+            *out_candidate_cols = buf;
+        }
+    }
+    return SPRREF_INC_NEEDS_PIVOT;
+}
+
+void sprref_inc_commit_pivot(sprref_inc_t* h, uint32_t pivot_col) {
+    if (!h || !h->has_pending) return;
+    h->has_pending = false;
+    Row row = std::move(h->pending_row);
+    uint64_t rhs = h->pending_rhs;
+    h->pending_row.clear();
+    h->pending_rhs = 0;
+
+    /* Validate pivot is in the row. If not, no-op (caller misuse). */
+    if (row.find(pivot_col) == row.end()) return;
+    commit_pivot_internal(h, std::move(row), rhs, pivot_col);
+}
+
+void sprref_inc_abort_pending(sprref_inc_t* h) {
+    if (!h) return;
+    h->pending_row.clear();
+    h->pending_rhs = 0;
+    h->has_pending = false;
+}
+
+void sprref_inc_buffer_free_u32(uint32_t* ptr) {
+    std::free(ptr);
+}
+
 
 int sprref_inc_is_solved(sprref_inc_t* h,
                          uint32_t var_idx,

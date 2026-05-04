@@ -47,6 +47,9 @@ typedef struct sprref_inc sprref_inc_t;
 #define SPRREF_INC_HAS_FREE   1  /* is a pivot, but some non-master/non-free col remains */
 #define SPRREF_INC_SOLVED     2  /* is a pivot AND fully reduced (all off-pivot cols accounted for) */
 
+/* Extra status code for sprref_inc_insert_forward. */
+#define SPRREF_INC_NEEDS_PIVOT 3  /* row reduced to non-empty form; caller must pick a pivot column */
+
 /* Lifecycle ----------------------------------------------------------------- */
 
 /*
@@ -92,7 +95,82 @@ SPRREF_API void sprref_inc_add_pivot_keys(sprref_inc_t* h,
                                           const uint64_t* keys,
                                           size_t n);
 
-/* Insert -------------------------------------------------------------------- */
+/*
+   Two-component variant of add_pivot_keys: each column gets a *pair* of
+   uint64 keys, compared lexicographically (key0 first, key1 as tiebreaker).
+   This is necessary when the natural pivot priority is a tuple that doesn't
+   fit in 64 bits (e.g. a Laporta key whose first four scalar components fit
+   in key0 but whose tail components need additional bits in key1).
+
+   Calling this with a column that already has a single-uint64 key (set via
+   set_pivot_order or add_pivot_keys) overwrites both halves; mixing the two
+   forms on different columns is allowed (a column with no key1 is treated
+   as key1==0 for comparison).
+*/
+SPRREF_API void sprref_inc_add_pivot_keys2(sprref_inc_t* h,
+                                           const uint32_t* cols,
+                                           const uint64_t* key0s,
+                                           const uint64_t* key1s,
+                                           size_t n);
+
+/* Two-phase insert ---------------------------------------------------------- */
+
+/*
+   Phase 1: forward eliminate the incoming row against existing pivots.
+   Stashes the reduced row in the handle's pending slot.
+
+   Returns one of:
+     SPRREF_INC_DEPENDENT    - row reduced to 0 = 0; nothing pending. out_* untouched.
+     SPRREF_INC_INCONSISTENT - row reduced to 0 = nonzero; nothing pending. out_* untouched.
+     SPRREF_INC_NEEDS_PIVOT  - row pivotable. out_candidate_cols / out_n_candidates are
+                               populated with the column indices of the reduced row's
+                               non-zero entries. The caller must pick one of them
+                               (typically using its own pivot ordering, applying
+                               master / acceptable_free filtering Python-side) and
+                               then call sprref_inc_commit_pivot.
+                               out_candidate_cols is heap-allocated; free via
+                               sprref_inc_buffer_free_u32.
+
+   Designed to keep the actual pivot ordering decision in the calling
+   language (Python in our case), which matches SpotlightSolverSparseGF
+   semantics bit-for-bit without needing to translate Python comparison
+   keys into the C side.
+
+   At most one pending row may exist on a handle at a time. Calling this
+   while a pending row exists overwrites the pending slot.
+*/
+SPRREF_API int sprref_inc_insert_forward(
+    sprref_inc_t* h,
+    const uint32_t* cols,
+    const uint64_t* vals,
+    size_t nnz,
+    uint64_t rhs,
+    uint32_t** out_candidate_cols,
+    size_t* out_n_candidates);
+
+/*
+   Phase 2 (success): commit the pending row using pivot_col as the pivot.
+   Performs normalisation (so the pivot coefficient becomes 1) and eager
+   backward substitution against existing basis rows (zeroing out pivot_col
+   in every row that touches it). After this the basis is in true RREF.
+
+   pivot_col MUST be one of the candidate columns returned by the matching
+   sprref_inc_insert_forward call; passing a column not in the pending row
+   is undefined behaviour.
+*/
+SPRREF_API void sprref_inc_commit_pivot(sprref_inc_t* h, uint32_t pivot_col);
+
+/*
+   Phase 2 (cancel): discard the pending row without modifying the basis.
+   Use when the caller decides the row can't be pivoted (e.g. all candidate
+   columns are masters): treat it as DEPENDENT instead.
+*/
+SPRREF_API void sprref_inc_abort_pending(sprref_inc_t* h);
+
+/* Free a uint32 buffer allocated by sprref_inc_insert_forward. */
+SPRREF_API void sprref_inc_buffer_free_u32(uint32_t* ptr);
+
+/* Single-call insert (legacy / direct C-API users) -------------------------- */
 
 /* Sentinel for "no preferred pivot" in sprref_inc_insert. */
 #define SPRREF_INC_NO_PREF UINT32_MAX
