@@ -41,9 +41,11 @@ typedef struct sprref_inc sprref_inc_t;
 #define SPRREF_INC_DEPENDENT   1
 #define SPRREF_INC_INCONSISTENT 2
 
-/* Boolean returns for sprref_inc_is_solved. */
-#define SPRREF_INC_NOT_SOLVED 0
-#define SPRREF_INC_SOLVED     1
+/* Returns for sprref_inc_is_solved (three-way: distinguishes "var_idx is
+   not a pivot at all" from "is a pivot but has unaccounted free columns"). */
+#define SPRREF_INC_NOT_PIVOT  0  /* var_idx has no pivot row in the basis */
+#define SPRREF_INC_HAS_FREE   1  /* is a pivot, but some non-master/non-free col remains */
+#define SPRREF_INC_SOLVED     2  /* is a pivot AND fully reduced (all off-pivot cols accounted for) */
 
 /* Lifecycle ----------------------------------------------------------------- */
 

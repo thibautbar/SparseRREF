@@ -208,7 +208,7 @@ void normalize_around_pivot(Row& row, uint64_t& rhs, uint32_t pivot, uint64_t p)
 extern "C" {
 
 const char* sprref_inc_version(void) {
-    return "sprref_incremental v0.2.0 (M3: is_solved + expression buffers)";
+    return "sprref_incremental v0.2.1 (M3: is_solved 3-way return)";
 }
 
 sprref_inc_t* sprref_inc_init(uint64_t field_order, int n_threads) {
@@ -334,10 +334,10 @@ int sprref_inc_is_solved(sprref_inc_t* h,
                          uint64_t** out_vals,
                          size_t* out_nnz,
                          uint64_t* out_rhs) {
-    if (!h) return SPRREF_INC_NOT_SOLVED;
+    if (!h) return SPRREF_INC_NOT_PIVOT;
 
     auto it = h->basis.find(var_idx);
-    if (it == h->basis.end()) return SPRREF_INC_NOT_SOLVED;
+    if (it == h->basis.end()) return SPRREF_INC_NOT_PIVOT;
 
     const PivotRow& pr = it->second;
 
@@ -381,7 +381,7 @@ int sprref_inc_is_solved(sprref_inc_t* h,
                 *out_cols = nullptr;
                 *out_vals = nullptr;
                 if (out_nnz) *out_nnz = 0;
-                return SPRREF_INC_NOT_SOLVED;
+                return SPRREF_INC_NOT_PIVOT; /* allocation failure: degrade safely */
             }
             size_t i = 0;
             for (auto& [c, v] : pr.coeffs) {
@@ -394,7 +394,7 @@ int sprref_inc_is_solved(sprref_inc_t* h,
         }
     }
 
-    return has_free ? SPRREF_INC_NOT_SOLVED : SPRREF_INC_SOLVED;
+    return has_free ? SPRREF_INC_HAS_FREE : SPRREF_INC_SOLVED;
 }
 
 void sprref_inc_buffer_free(uint32_t* cols, uint64_t* vals) {
