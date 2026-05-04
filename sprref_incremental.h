@@ -80,23 +80,36 @@ SPRREF_API void sprref_inc_set_pivot_order(sprref_inc_t* h,
 
 /* Insert -------------------------------------------------------------------- */
 
+/* Sentinel for "no preferred pivot" in sprref_inc_insert. */
+#define SPRREF_INC_NO_PREF UINT32_MAX
+
 /*
    Insert one sparse augmented row [a | b] where a has nnz entries
    (cols[i], vals[i]) and b is rhs. All values are reduced modulo field_order
-   on entry (pass any nonneg or signed mod-p representative; will be canonicalised).
+   on entry (pass any nonneg representative; will be canonicalised).
+
+   preferred_pivot: if not SPRREF_INC_NO_PREF and that column is present in
+     the (forward-reduced) row and is not a master, it is used as the pivot.
+     Otherwise the lowest-pivot-key non-master column wins (with column index
+     as fallback tie-breaker).
 
    The row is reduced against existing pivots (forward elimination). If the
    reduced row is empty:
      - rhs == 0  -> SPRREF_INC_DEPENDENT
      - rhs != 0  -> SPRREF_INC_INCONSISTENT
-   Otherwise a new pivot is chosen (according to pivot_order, masters last)
-   and the row is normalised; SPRREF_INC_INDEPENDENT is returned.
+   Otherwise a new pivot is chosen, the row is normalised so the pivot
+   coefficient is 1, eager backward substitution removes the new pivot column
+   from all existing basis rows, and SPRREF_INC_INDEPENDENT is returned.
+
+   Post-condition (on independent return): the basis is in true reduced row
+   echelon form — each pivot column has 0 in all other pivot rows.
 */
 SPRREF_API int sprref_inc_insert(sprref_inc_t* h,
                                  const uint32_t* cols,
                                  const uint64_t* vals,
                                  size_t nnz,
-                                 uint64_t rhs);
+                                 uint64_t rhs,
+                                 uint32_t preferred_pivot);
 
 /* Query --------------------------------------------------------------------- */
 

@@ -1,28 +1,27 @@
 /*
     sprref_incremental.cpp
 
-    M1 scaffolding for the incremental sparse RREF C-API. This compiles into
-    a shared library (libsparse_rref_inc.{dylib,so}) but the algorithmic core
-    is stubbed out and will be implemented in M2/M3.
+    Incremental sparse RREF over GF(p) with eager backward substitution.
 
-    The state layout is the minimum the M2/M3 work will need:
-      - field setup (prime / Flint field_t)
-      - per-handle thread pool (kept as ptr for ABI compat across translation
-        units; constructed in init, destroyed in free)
-      - pivot ordering and master set
-      - the RREF basis: a map from pivot column -> normalised sparse row
-      - reverse index col -> set of pivot-rows containing that column (for
-        cheap forward elimination of new rows)
-      - last_insert_changed_basis flag (controls is_solved cache invalidation)
+    State model:
+      - basis: pivot column -> normalised row (off-pivot entries) + rhs
+      - col_to_pivots: column -> set of pivot columns whose row touches it
+        (reverse index, used to find rows needing eager backsub when a new
+         pivot column appears)
+      - pivot_keys: optional Laporta ordering for pivot selection
+      - masters: columns that may never be pivoted
 
-    Concurrent calls on the same handle are NOT supported. Callers (Python
-    wrappers, mp.Pool workers) should each own their own handle.
+    On every successful insert the basis is left in true RREF (each pivot
+    column appears with coefficient 0 in all other pivot rows). This matches
+    SpotlightSolverSparseGF semantics and makes is_solved a near-O(1) lookup.
+
+    Concurrency: a handle is NOT thread-safe. Use one handle per
+    mp.Pool worker.
 */
 
 #include "sprref_incremental.h"
 
-#include "sparse_mat.h"
-#include "sparse_rref.h"
+#include <flint/ulong_extras.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -32,62 +31,130 @@
 #include <unordered_set>
 #include <vector>
 
-using SparseRREF::field_t;
-using SparseRREF::RING;
-
 namespace {
 
-using Row = std::unordered_map<uint32_t, uint64_t>; /* col -> coeff (mod p) */
+using Row = std::unordered_map<uint32_t, uint64_t>;
 
 struct PivotRow {
-    /* Normalised so pivot coefficient == 1. */
-    Row coeffs;     /* off-pivot columns only (pivot column omitted) */
+    Row coeffs;     /* off-pivot columns only (the pivot column itself is implicit, with value 1) */
     uint64_t rhs;
 };
+
+inline uint64_t mulmod(uint64_t a, uint64_t b, uint64_t p) {
+    /* Use 128-bit intermediate to avoid overflow for primes up to 2^63. */
+    return (uint64_t)((__uint128_t)a * b % p);
+}
+
+inline uint64_t submod(uint64_t a, uint64_t b, uint64_t p) {
+    return (a >= b) ? (a - b) : (a + p - b);
+}
 
 } /* namespace */
 
 struct sprref_inc {
-    uint64_t prime;
-    field_t F;
-    int n_threads;
-
+    uint64_t prime = 0;
     uint32_t nvars = 0;
 
-    /* pivot column -> normalised row */
     std::unordered_map<uint32_t, PivotRow> basis;
-
-    /* reverse index: column -> set of pivot columns whose row touches that column */
     std::unordered_map<uint32_t, std::unordered_set<uint32_t>> col_to_pivots;
-
-    /* pivot ordering: smaller key preferred. Columns not listed fall back to
-       sort by numeric column id. */
     std::unordered_map<uint32_t, uint64_t> pivot_keys;
-
     std::unordered_set<uint32_t> masters;
-
-    bool dirty_since_last_solve = false;
 };
 
 /* =========================================================================
-   Helpers (M1: minimal — full impl in M2/M3)
+   Internal helpers
    ========================================================================= */
 
 namespace {
 
-inline uint64_t mod_reduce(uint64_t x, uint64_t p) {
-    return x % p;
+/* col_to_pivots[c] = { pivot rows whose stored .coeffs (off-pivot part) contains c }.
+   Used by eager backsub to find rows that need their entry at a new pivot column
+   zeroed out. The pivot column itself is NOT inserted into col_to_pivots[pivot]
+   (its presence in basis is checked directly via h->basis.count). */
+void index_row(sprref_inc_t* h, uint32_t pivot, const Row& row) {
+    for (auto& [c, v] : row) {
+        (void)v;
+        h->col_to_pivots[c].insert(pivot);
+    }
 }
 
-/* Stub: forward eliminate `row` against existing basis pivots. No-op for M1. */
-void forward_eliminate(sprref_inc_t* /*h*/, Row& /*row*/, uint64_t& /*rhs*/) {
-    /* TODO(M2): for each pivot column c present in row, saxpy row -= row[c] * basis[c]. */
+void deindex_row(sprref_inc_t* h, uint32_t pivot, const Row& row) {
+    for (auto& [c, v] : row) {
+        (void)v;
+        auto it = h->col_to_pivots.find(c);
+        if (it == h->col_to_pivots.end()) continue;
+        it->second.erase(pivot);
+        if (it->second.empty()) h->col_to_pivots.erase(it);
+    }
 }
 
-/* Stub: choose pivot column from a reduced row. Returns false if row empty.
-   M1 picks the lowest-key non-master column; full Laporta logic comes in M2. */
-bool choose_pivot(const sprref_inc_t* h, const Row& row, uint32_t& out_pivot) {
+/* dst -= factor * src ; arithmetic mod p. */
+void saxpy(Row& dst_row, uint64_t& dst_rhs,
+           uint64_t factor,
+           const Row& src_row, uint64_t src_rhs,
+           uint64_t p) {
+    if (factor == 0) return;
+    for (auto& [c, v] : src_row) {
+        uint64_t prod = mulmod(factor, v, p);
+        if (prod == 0) continue;
+        auto it = dst_row.find(c);
+        if (it == dst_row.end()) {
+            dst_row.emplace(c, p - prod); /* 0 - prod */
+        } else {
+            uint64_t nv = submod(it->second, prod, p);
+            if (nv == 0) dst_row.erase(it);
+            else it->second = nv;
+        }
+    }
+    if (src_rhs != 0) {
+        uint64_t prod = mulmod(factor, src_rhs, p);
+        dst_rhs = submod(dst_rhs, prod, p);
+    }
+}
+
+/* Forward elimination: while `row` contains a pivot column, saxpy against
+   basis. Loops until fixed point (each saxpy may introduce columns from
+   src that are themselves pivots — though in true RREF this never happens,
+   we don't rely on that invariant here so the impl is robust to lazy state). */
+void forward_eliminate(sprref_inc_t* h, Row& row, uint64_t& rhs) {
+    const uint64_t p = h->prime;
+    while (true) {
+        uint32_t pivot = 0;
+        bool found = false;
+        for (auto& [c, v] : row) {
+            (void)v;
+            if (h->basis.count(c)) {
+                pivot = c;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return;
+
+        uint64_t factor = row[pivot];
+        /* The pivot is normalised to 1, so eliminating it means subtracting
+           factor * (basis_row + e_pivot). The pivot column itself is implicit
+           in the stored basis row (coeff 1). */
+        row.erase(pivot);  /* equivalent to subtracting factor*1 from row[pivot] */
+        const PivotRow& src = h->basis.at(pivot);
+        saxpy(row, rhs, factor, src.coeffs, src.rhs, p);
+    }
+}
+
+bool choose_pivot(const sprref_inc_t* h,
+                  const Row& row,
+                  uint32_t preferred_pivot,
+                  uint32_t& out_pivot) {
     if (row.empty()) return false;
+
+    /* Spotlight semantics: preferred_pivot wins iff present and non-master. */
+    if (preferred_pivot != SPRREF_INC_NO_PREF) {
+        auto it = row.find(preferred_pivot);
+        if (it != row.end() && !h->masters.count(preferred_pivot)) {
+            out_pivot = preferred_pivot;
+            return true;
+        }
+    }
 
     bool found = false;
     uint32_t best_col = 0;
@@ -97,11 +164,12 @@ bool choose_pivot(const sprref_inc_t* h, const Row& row, uint32_t& out_pivot) {
         return it != h->pivot_keys.end() ? it->second : (uint64_t)c;
     };
 
-    for (auto& kv : row) {
-        uint32_t c = kv.first;
+    for (auto& [c, v] : row) {
+        (void)v;
         if (h->masters.count(c)) continue;
         uint64_t k = key_of(c);
-        if (!found || k < best_key) {
+        /* Tie-break by column index for determinism. */
+        if (!found || k < best_key || (k == best_key && c < best_col)) {
             found = true;
             best_key = k;
             best_col = c;
@@ -111,7 +179,27 @@ bool choose_pivot(const sprref_inc_t* h, const Row& row, uint32_t& out_pivot) {
     return found;
 }
 
-} /* namespace */
+/* Multiply row+rhs by inverse of row[pivot], then erase the pivot entry
+   (it's stored implicitly as coefficient 1). */
+void normalize_around_pivot(Row& row, uint64_t& rhs, uint32_t pivot, uint64_t p) {
+    auto it = row.find(pivot);
+    if (it == row.end()) return; /* shouldn't happen: caller chose this pivot */
+    uint64_t pv = it->second;
+    if (pv == 1) {
+        row.erase(it);
+        return;
+    }
+    uint64_t inv = n_invmod(pv, p);
+    /* In-place scale (skip pivot — we'll erase it). */
+    for (auto& kv : row) {
+        if (kv.first == pivot) continue;
+        kv.second = mulmod(kv.second, inv, p);
+    }
+    rhs = mulmod(rhs, inv, p);
+    row.erase(pivot);
+}
+
+} /* anonymous namespace */
 
 /* =========================================================================
    API
@@ -120,21 +208,17 @@ bool choose_pivot(const sprref_inc_t* h, const Row& row, uint32_t& out_pivot) {
 extern "C" {
 
 const char* sprref_inc_version(void) {
-    return "sprref_incremental v0.0.1 (M1 scaffolding)";
+    return "sprref_incremental v0.1.0 (M2: insert + eager backsub)";
 }
 
 sprref_inc_t* sprref_inc_init(uint64_t field_order, int n_threads) {
     if (field_order < 3) return nullptr;
     if (n_threads < 1) n_threads = 1;
-
     auto* h = new (std::nothrow) sprref_inc_t();
     if (!h) return nullptr;
-
     h->prime = field_order;
-    h->n_threads = n_threads;
-    /* Flint Fp field setup. */
-    h->F = field_t(RING::FIELD_Fp, field_order);
     h->nvars = 0;
+    (void)n_threads; /* M2 is single-threaded; M5 may parallelise saxpy. */
     return h;
 }
 
@@ -168,35 +252,77 @@ int sprref_inc_insert(sprref_inc_t* h,
                       const uint32_t* cols,
                       const uint64_t* vals,
                       size_t nnz,
-                      uint64_t rhs) {
+                      uint64_t rhs,
+                      uint32_t preferred_pivot) {
     if (!h) return SPRREF_INC_DEPENDENT;
     const uint64_t p = h->prime;
 
     Row row;
     row.reserve(nnz);
     for (size_t i = 0; i < nnz; ++i) {
-        uint64_t v = mod_reduce(vals[i], p);
-        if (v != 0) row[cols[i]] = v;
+        uint64_t v = vals[i] % p;
+        if (v != 0) {
+            uint32_t c = cols[i];
+            /* Combine duplicates if any (mod p sum). */
+            auto it = row.find(c);
+            if (it == row.end()) row.emplace(c, v);
+            else {
+                uint64_t sum = it->second + v;
+                if (sum >= p) sum -= p;
+                if (sum == 0) row.erase(it);
+                else it->second = sum;
+            }
+            if (c >= h->nvars) h->nvars = c + 1;
+        }
     }
-    rhs = mod_reduce(rhs, p);
+    rhs %= p;
 
     forward_eliminate(h, row, rhs);
 
     if (row.empty()) {
-        if (rhs == 0) return SPRREF_INC_DEPENDENT;
-        return SPRREF_INC_INCONSISTENT;
+        return rhs == 0 ? SPRREF_INC_DEPENDENT : SPRREF_INC_INCONSISTENT;
     }
 
     uint32_t pivot_col = 0;
-    if (!choose_pivot(h, row, pivot_col)) {
-        /* All remaining columns are masters: treat as dependent (cannot pivot). */
+    if (!choose_pivot(h, row, preferred_pivot, pivot_col)) {
+        /* All remaining entries are masters: no pivotable column. */
         return SPRREF_INC_DEPENDENT;
     }
 
-    /* M1: skip normalisation and basis insertion to keep this a pure stub.
-       M2 will normalise (multiply by inverse of row[pivot_col]) and store. */
-    (void)pivot_col;
-    h->dirty_since_last_solve = true;
+    normalize_around_pivot(row, rhs, pivot_col, p);
+
+    /* Eager backward substitution: zero out pivot_col in every existing
+       basis row that touches it. We use the reverse index, then re-index
+       each modified row since saxpy may add/remove columns. */
+    auto rev_it = h->col_to_pivots.find(pivot_col);
+    if (rev_it != h->col_to_pivots.end()) {
+        /* Snapshot: saxpy will mutate col_to_pivots, so iterate over a copy. */
+        std::vector<uint32_t> affected(rev_it->second.begin(), rev_it->second.end());
+        for (uint32_t other_pivot : affected) {
+            if (other_pivot == pivot_col) continue; /* not in basis yet, but defensive */
+            auto bit = h->basis.find(other_pivot);
+            if (bit == h->basis.end()) continue;
+            PivotRow& other = bit->second;
+            auto cit = other.coeffs.find(pivot_col);
+            if (cit == other.coeffs.end() || cit->second == 0) continue;
+            uint64_t factor = cit->second;
+            /* Deindex, saxpy against (row, rhs) [which has implicit pivot 1 — but the
+               new pivot row's stored coeffs do NOT include pivot_col since we erased it,
+               and the implicit "1 at pivot_col" cancels exactly with `factor` at that column].
+               After saxpy + erasing pivot_col entry, the row no longer touches pivot_col. */
+            deindex_row(h, other_pivot, other.coeffs);
+            other.coeffs.erase(cit); /* implicit "1" cancels factor exactly */
+            saxpy(other.coeffs, other.rhs, factor, row, rhs, p);
+            index_row(h, other_pivot, other.coeffs);
+        }
+    }
+
+    /* Insert new pivot. */
+    h->basis.emplace(pivot_col, PivotRow{std::move(row), rhs});
+    index_row(h, pivot_col, h->basis[pivot_col].coeffs);
+
+    if (pivot_col >= h->nvars) h->nvars = pivot_col + 1;
+
     return SPRREF_INC_INDEPENDENT;
 }
 
@@ -209,7 +335,7 @@ int sprref_inc_is_solved(sprref_inc_t* h,
                          size_t* /*out_nnz*/,
                          uint64_t* /*out_rhs*/) {
     if (!h) return SPRREF_INC_NOT_SOLVED;
-    /* M1 stub: nothing is ever solved. M3 will add lazy backsub + extraction. */
+    /* M3 will fill out_* and apply acceptable_free filtering. */
     (void)var_idx;
     return SPRREF_INC_NOT_SOLVED;
 }
