@@ -208,7 +208,7 @@ void normalize_around_pivot(Row& row, uint64_t& rhs, uint32_t pivot, uint64_t p)
 extern "C" {
 
 const char* sprref_inc_version(void) {
-    return "sprref_incremental v0.2.1 (M3: is_solved 3-way return)";
+    return "sprref_incremental v0.3.0 (delta pivot keys)";
 }
 
 sprref_inc_t* sprref_inc_init(uint64_t field_order, int n_threads) {
@@ -245,6 +245,15 @@ void sprref_inc_set_pivot_order(sprref_inc_t* h,
     if (!h) return;
     h->pivot_keys.clear();
     h->pivot_keys.reserve(n);
+    for (size_t i = 0; i < n; ++i) h->pivot_keys[cols[i]] = keys[i];
+}
+
+void sprref_inc_add_pivot_keys(sprref_inc_t* h,
+                               const uint32_t* cols,
+                               const uint64_t* keys,
+                               size_t n) {
+    if (!h) return;
+    h->pivot_keys.reserve(h->pivot_keys.size() + n);
     for (size_t i = 0; i < n; ++i) h->pivot_keys[cols[i]] = keys[i];
 }
 

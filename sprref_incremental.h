@@ -80,6 +80,18 @@ SPRREF_API void sprref_inc_set_pivot_order(sprref_inc_t* h,
                                            const uint64_t* keys,
                                            size_t n);
 
+/*
+   Upsert version of set_pivot_order: adds (cols[i] -> keys[i]) entries
+   without clearing existing ones. Existing keys for the same column are
+   overwritten. This is the hot path for monotonically growing pivot_order
+   maps (e.g. as new integrals are inserted into the solver) — callers can
+   push only the delta on each step instead of the full map.
+*/
+SPRREF_API void sprref_inc_add_pivot_keys(sprref_inc_t* h,
+                                          const uint32_t* cols,
+                                          const uint64_t* keys,
+                                          size_t n);
+
 /* Insert -------------------------------------------------------------------- */
 
 /* Sentinel for "no preferred pivot" in sprref_inc_insert. */
