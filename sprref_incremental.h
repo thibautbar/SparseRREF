@@ -247,6 +247,26 @@ SPRREF_API void sprref_inc_buffer_free(uint32_t* cols, uint64_t* vals);
 SPRREF_API size_t sprref_inc_rank(const sprref_inc_t* h);
 SPRREF_API uint32_t sprref_inc_nvars(const sprref_inc_t* h);
 
+/*
+   Batch query: for each cols[i], write to out_freqs[i] the number of basis
+   rows whose stored form contains column cols[i] as a non-zero entry.
+
+   Matches SpotlightSolverSparseGF.get_variable_freq semantics: a pivot
+   column counts its own basis row (the stored "off-pivot" row implicitly
+   has coefficient 1 at the pivot). Non-pivot columns count only the rows
+   in which they appear after eager backsub.
+
+   Used by the RL observation feature `solver_freq` and called per-step,
+   so it's batched to amortise the FFI call overhead.
+
+   out_freqs must point to a buffer of at least n uint64_t. Pass n=0 to
+   no-op.
+*/
+SPRREF_API void sprref_inc_variable_freqs(const sprref_inc_t* h,
+                                          const uint32_t* cols,
+                                          size_t n,
+                                          uint64_t* out_freqs);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

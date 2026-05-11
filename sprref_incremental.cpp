@@ -242,7 +242,7 @@ void normalize_around_pivot(Row& row, uint64_t& rhs, uint32_t pivot, uint64_t p)
 extern "C" {
 
 const char* sprref_inc_version(void) {
-    return "sprref_incremental v0.5.0 (two-phase insert; pivot choice in caller)";
+    return "sprref_incremental v0.6.0 (variable freqs batch query)";
 }
 
 sprref_inc_t* sprref_inc_init(uint64_t field_order, int n_threads) {
@@ -557,6 +557,29 @@ size_t sprref_inc_rank(const sprref_inc_t* h) {
 uint32_t sprref_inc_nvars(const sprref_inc_t* h) {
     if (!h) return 0;
     return h->nvars;
+}
+
+void sprref_inc_variable_freqs(const sprref_inc_t* h,
+                               const uint32_t* cols,
+                               size_t n,
+                               uint64_t* out_freqs) {
+    if (!out_freqs || n == 0) return;
+    if (!h) {
+        for (size_t i = 0; i < n; ++i) out_freqs[i] = 0;
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t c = cols[i];
+        size_t cnt = 0;
+        auto it = h->col_to_pivots.find(c);
+        if (it != h->col_to_pivots.end()) cnt = it->second.size();
+        /* Match Spotlight: a pivot column also counts its own basis row.
+           The C-side basis stores the pivot row with the pivot column
+           erased (coefficient 1 is implicit), so col_to_pivots never
+           contains the self-edge; add it back here. */
+        if (h->basis.count(c)) cnt += 1;
+        out_freqs[i] = (uint64_t)cnt;
+    }
 }
 
 } /* extern "C" */
