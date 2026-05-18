@@ -242,7 +242,7 @@ void normalize_around_pivot(Row& row, uint64_t& rhs, uint32_t pivot, uint64_t p)
 extern "C" {
 
 const char* sprref_inc_version(void) {
-    return "sprref_incremental v0.6.0 (variable freqs batch query)";
+    return "sprref_incremental v0.7.0 (col_rows reverse index accessor)";
 }
 
 sprref_inc_t* sprref_inc_init(uint64_t field_order, int n_threads) {
@@ -580,6 +580,36 @@ void sprref_inc_variable_freqs(const sprref_inc_t* h,
         if (h->basis.count(c)) cnt += 1;
         out_freqs[i] = (uint64_t)cnt;
     }
+}
+
+void sprref_inc_col_rows(const sprref_inc_t* h,
+                         uint32_t col,
+                         uint32_t** out_pivots,
+                         size_t* out_n) {
+    if (!out_pivots || !out_n) return;
+    *out_pivots = nullptr;
+    *out_n = 0;
+    if (!h) return;
+
+    auto it = h->col_to_pivots.find(col);
+    const bool self_pivot = h->basis.count(col) > 0;
+    const size_t base = (it == h->col_to_pivots.end()) ? 0 : it->second.size();
+    const size_t total = base + (self_pivot ? 1 : 0);
+    if (total == 0) return;
+
+    auto* buf = static_cast<uint32_t*>(std::malloc(total * sizeof(uint32_t)));
+    if (!buf) return;  /* allocation failure surfaces as empty result */
+
+    size_t k = 0;
+    if (it != h->col_to_pivots.end()) {
+        for (uint32_t p : it->second) buf[k++] = p;
+    }
+    /* Self-edge: included exactly when `col` is a pivot — col_to_pivots is
+       guaranteed not to contain it (see deindex on pivot install). */
+    if (self_pivot) buf[k++] = col;
+
+    *out_pivots = buf;
+    *out_n = total;
 }
 
 } /* extern "C" */

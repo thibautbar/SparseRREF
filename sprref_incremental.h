@@ -267,6 +267,26 @@ SPRREF_API void sprref_inc_variable_freqs(const sprref_inc_t* h,
                                           size_t n,
                                           uint64_t* out_freqs);
 
+/*
+   Reverse index lookup: write to *out_pivots / *out_n the list of pivot
+   column indices whose stored basis row contains `col` as a non-zero entry.
+
+   Matches SpotlightSolverSparseGF.col_rows semantics: if `col` is itself a
+   pivot, its own basis row is included (the C-side col_to_pivots never
+   carries the self-edge because the pivot coefficient is implicit, so this
+   accessor adds it back explicitly to keep parity with Spotlight).
+
+   Output is heap-allocated; free via sprref_inc_buffer_free_u32. When the
+   column has no entries, *out_pivots = NULL and *out_n = 0.
+
+   Used by the active master pruner to find basis rows containing a candidate
+   column without paying the cost of materialising the full basis.
+*/
+SPRREF_API void sprref_inc_col_rows(const sprref_inc_t* h,
+                                    uint32_t col,
+                                    uint32_t** out_pivots,
+                                    size_t* out_n);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
